@@ -113,6 +113,7 @@ export default function Home() {
   const [analysisRequestId, setAnalysisRequestId] = useState<string | null>(null);
   const [analysisWorker, setAnalysisWorker] = useState<Worker | null>(null);
   const analysisListenerRef = useRef<((ev: MessageEvent) => void) | null>(null);
+  const cyRef = useRef<unknown>(null);
   const [resultsPage, setResultsPage] = useState(1);
   const resultsPageSize = 50;
   const [auditEvents, setAuditEvents] = useState<Array<{ id: string; type: string; at: string; summary: string }>>([]);
@@ -322,6 +323,17 @@ export default function Home() {
       setAnalysisWorker(null);
     };
   }, []);
+
+  // Prevent Cytoscape from calling renderer.notify() after unmount when layouts/animations are still running.
+  useEffect(() => {
+    if (activeTab === 'graph') return;
+    try {
+      const cy = cyRef.current as { stop?: () => void } | null;
+      cy?.stop?.();
+    } catch {
+      // ignore
+    }
+  }, [activeTab]);
 
   const evidenceObject = useMemo(() => {
     const profileLinks = Object.fromEntries(
@@ -2302,6 +2314,9 @@ export default function Home() {
             <div style={{ width: '100%', height: '640px' }}>
               <CytoscapeComponent
                 elements={elements}
+                cy={(cy: unknown) => {
+                  cyRef.current = cy;
+                }}
                 style={{ width: '100%', height: '100%' }}
                 stylesheet={[
                   {
@@ -2315,7 +2330,7 @@ export default function Home() {
                       'text-valign': 'center',
                       'text-halign': 'center',
                       'font-size': '10px',
-                      color: 'rgb(226 232 240)',
+                      color: 'rgb(248 250 252)',
                       'text-outline-color': 'rgb(2 6 23)',
                       'text-outline-width': 1,
                     },
@@ -2325,10 +2340,13 @@ export default function Home() {
                     style: {
                       width: 2,
                       'line-color': 'rgb(52 211 153)',
+                      'target-arrow-color': 'rgb(52 211 153)',
+                      'target-arrow-shape': 'triangle',
+                      'curve-style': 'bezier',
                     },
                   },
                 ]}
-                layout={{ name: 'cose' }}
+                layout={{ name: 'cose', animate: false, fit: true, randomize: true }}
               />
             </div>
           </Card>

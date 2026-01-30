@@ -210,10 +210,36 @@ Sybil Shield uses pragmatic, local-first versions of these ideas:
 - seed-based propagation (from your reviews) for human-in-the-loop trust/suspicion diffusion
 - explainable timing + behavior signals for coordination farms
 
+## Related coordinated abuse (beyond “Sybil”)
+
+In the wild, “Sybil” often overlaps with other coordinated abuse. Sybil Shield is built to surface these patterns as **signals**, not to auto-ban.
+
+- **Sockpuppeting / multi-accounting**: one operator runs many accounts for influence. Signals: controller groups, shared links/domains, shared funders, same-target similarity.
+- **Brigading / coordinated harassment**: many accounts target one user/repo in a short time. Signals: waves (bin + sliding window), high churn against a target, low diversity.
+- **Astroturfing / fake engagement**: staged “organic” activity. Signals: repeated sequences, low entropy, unnatural circadian patterns, reciprocity anomalies.
+- **Airdrop farming / wallet farms**: clusters of wallets farming rewards. Signals: common funders, transfer bursts, identical behavior patterns.
+- **Wash trading / fake volume** (marketplace contexts): repeated counterparty patterns and bursts. Signals: tight clusters, repeated sequences, rapid velocity, target overlap.
+- **Phishing / wallet drainer campaigns**: many accounts promote the same malicious endpoints. Signals: suspicious/typosquat domains, shared links, phishing-like URL heuristics.
+
+## Platform-specific mapping (how to model your logs)
+
+You get best results when you normalize actions per platform into the same schema:
+
+- **GitHub**: `star`, `unstar`, `follow`, `unfollow`, `fork`, `issue`, `pr`
+- **Farcaster / social**: `follow`, `unfollow`, `like`, `recast`, `reply`
+- **Mini-apps (Telegram/Web3 games)**: `tap`, `claim`, `reward`, `invite`, `join`, `purchase`
+- **Onchain (Base/EVM)**: `transfer`, `swap`, `mint`, `approve` (include `txHash`, `amount`, `meta.chainId` when possible)
+
+If your action names differ, update **Analysis → Positive actions / Churn actions** so the graph and churn signals align.
+
 ## Security hardening
 
 - API routes use **rate limiting** and **SSRF protections** (blocks localhost/private IPs for URL imports/scans).
 - The app ships common **security headers** (CSP, COOP/CORP, HSTS, etc.) via `next.config.ts`.
+
+## CI (GitHub Actions)
+
+This repo includes a basic CI workflow that runs `npm ci`, `npm run lint`, and `npm run build` on PRs and pushes to `main`.
 
 - **Waves**: many actions in the same time bin, on the same target
 - **Churn**: heavy `unfollow/unstar` behavior
