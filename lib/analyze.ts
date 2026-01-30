@@ -1,6 +1,9 @@
 import type { EdgeDefinition, ElementDefinition, NodeDefinition } from 'cytoscape';
 import { computeSharedLinksByActor, extractLinks, isSuspiciousDomain, linkDiversityScore, normalizeLinks, updateProfileAnomalyScore } from './profile';
-import { computeHandlePatternScores, isLikelyPhishingUrl } from './scam';
+import { computeHandlePatternScores, handleStem, isLikelyPhishingUrl } from './scam';
+import { computeControllerGroups, type ControllerGroup } from './entity';
+
+export type { ControllerGroup } from './entity';
 
 export type LogEntry = {
   timestamp: string;
@@ -57,6 +60,9 @@ export type AnalysisSettings = {
   velocityMaxActionsInWindow: number;
   sessionGapMinutes: number;
   actionNgramSize: number;
+  seedActors?: string[];
+  seedInfluence: number; // 0..1 additive boost
+  seedMaxHops: number; // 0..4
 };
 
 export type ActorScorecard = {
@@ -97,10 +103,17 @@ export type ActorScorecard = {
   avgSessionMinutes: number;
   avgSessionGapMinutes: number;
   maxSessionGapMinutes: number;
+  maxTargetJaccard: number;
+  topTargetJaccardActor: string;
+  seedProximityScore: number;
   sharedWallets: string[];
   crossAppPlatforms: string[];
   sessionCount: number;
   fraudTxScore: number;
+  controllerId?: number;
+  controllerGroupSize?: number;
+  controllerScore?: number;
+  controllerEvidence?: string[];
   reasons: string[];
 };
 
@@ -109,6 +122,7 @@ export type AnalysisResult = {
   clusters: DetailedCluster[];
   waves: WaveResult[];
   scorecards: ActorScorecard[];
+  controllers: ControllerGroup[];
 };
 
 export type AnalyzeProgress =
@@ -125,7 +139,7 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
   const report = (p: AnalyzeProgress) => onProgress?.(p);
   report({ stage: 'start', pct: 0 });
 
-  if (logs.length === 0) return { elements: [], clusters: [], waves: [], scorecards: [] };
+  if (logs.length === 0) return { elements: [], clusters: [], waves: [], scorecards: [], controllers: [] };
 
   const allTimes = logs.map((l) => new Date(l.timestamp).getTime()).filter((t) => Number.isFinite(t));
   const datasetStartMs = allTimes.length > 0 ? Math.min(...allTimes) : Date.now();
@@ -436,7 +450,7 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
   const handlePatterns = computeHandlePatternScores(Array.from(nodes));
 
   // Additional mini-app detections
-  const sharedWallets = detectSharedWallets(logs);
+  const sharedFundersByWallet = detectSharedWallets(logs);
   const crossAppLinks = detectCrossAppLinking(logs);
   const sessionMetrics = detectSessionMetrics(logs, Math.max(1, settings.sessionGapMinutes) * 60 * 1000);
   const fraudulentTx = detectFraudulentTransactions(logs);
@@ -447,6 +461,111 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
   );
   const circadianByActor = computeCircadianByActor(logs);
   const ngramByActor = computeActionNgramByActor(logs, Math.min(Math.max(2, settings.actionNgramSize), 5));
+
+  // Cross-actor similarity (same targets == coordinated ops / multi-account)
+  const maxJaccardByActor = new Map<string, { score: number; peer: string }>();
+  const targetToActors = new Map<string, string[]>();
+  Object.values(actorStats).forEach((s) => {
+    s.uniqueTargets.forEach((t) => {
+      if (!targetToActors.has(t)) targetToActors.set(t, []);
+      targetToActors.get(t)!.push(s.actor);
+    });
+  });
+  Object.values(actorStats).forEach((s) => {
+    const counts = new Map<string, number>();
+    s.uniqueTargets.forEach((t) => {
+      const co = targetToActors.get(t) || [];
+      for (const other of co) {
+        if (other === s.actor) continue;
+        counts.set(other, (counts.get(other) || 0) + 1);
+      }
+    });
+    let bestPeer = '';
+    let best = 0;
+    counts.forEach((intersect, peer) => {
+      const aSize = s.uniqueTargets.size;
+      const bSize = actorStats[peer].uniqueTargets.size;
+      const union = aSize + bSize - intersect;
+      if (union <= 0) return;
+      const j = intersect / union;
+      if (j > best) {
+        best = j;
+        bestPeer = peer;
+      }
+    });
+    maxJaccardByActor.set(s.actor, { score: best, peer: bestPeer });
+  });
+
+  // Seed-based propagation: if you already confirmed some sybils, expand suspicion to nearby nodes
+  const seedInfluence = Math.max(0, Math.min(settings.seedInfluence ?? 0, 1));
+  const seedMaxHops = Math.min(Math.max(settings.seedMaxHops ?? 0, 0), 4);
+  const seedProximity = new Map<string, number>();
+  const seeds = Array.from(new Set((settings.seedActors || []).map((x) => String(x))));
+  if (seeds.length > 0 && seedInfluence > 0 && seedMaxHops > 0) {
+    const queue: Array<{ node: string; hop: number }> = [];
+    const seenHop = new Map<string, number>();
+    for (const s of seeds) {
+      if (!nodes.has(s)) continue;
+      queue.push({ node: s, hop: 0 });
+      seenHop.set(s, 0);
+      seedProximity.set(s, 1);
+    }
+    while (queue.length) {
+      const { node, hop } = queue.shift()!;
+      if (hop >= seedMaxHops) continue;
+      const neighbors = graph[node] || [];
+      for (const nb of neighbors) {
+        const nextHop = hop + 1;
+        const prevHop = seenHop.get(nb);
+        if (prevHop !== undefined && prevHop <= nextHop) continue;
+        seenHop.set(nb, nextHop);
+        const proximity = Math.max(0, 1 - nextHop / (seedMaxHops + 0.0001));
+        seedProximity.set(nb, Math.max(seedProximity.get(nb) || 0, proximity));
+        queue.push({ node: nb, hop: nextHop });
+      }
+    }
+  }
+
+  // Controller / entity resolution (multi-account linking)
+  const bioByActor = new Map<string, string>();
+  const handleStemByActor = new Map<string, string>();
+  const extraWalletsByActor = new Map<string, string[]>();
+
+  Object.keys(actorStats).forEach((actor) => {
+    const profile = actorProfiles[actor] || {};
+    const existing = linksByActor.get(actor);
+    if (!existing) {
+      linksByActor.set(actor, normalizeLinks(profile.links || (profile.bio ? extractLinks(profile.bio) : [])));
+    }
+    const bio = (profile.bio || '').trim();
+    if (bio) bioByActor.set(actor, bio);
+    handleStemByActor.set(actor, handleStem(actor.includes(':') ? actor.split(':').slice(1).join(':') : actor));
+  });
+
+  // Map social actors -> wallets mentioned in links/bios/meta and onchain actors -> related wallets.
+  logs.forEach((log) => {
+    const candidates: string[] = [];
+    if (typeof log.meta === 'string' && log.meta) candidates.push(log.meta);
+    if (typeof log.txHash === 'string' && log.txHash) candidates.push(log.txHash);
+    const joined = candidates.join('\n');
+    if (!joined) return;
+    const wallets = Array.from(new Set((joined.match(/\b0x[a-fA-F0-9]{40}\b/g) || []).map((x) => x.toLowerCase())));
+    if (wallets.length === 0) return;
+    const a = log.actor;
+    if (!extraWalletsByActor.has(a)) extraWalletsByActor.set(a, []);
+    extraWalletsByActor.get(a)!.push(...wallets);
+  });
+  extraWalletsByActor.forEach((ws, actor) => extraWalletsByActor.set(actor, Array.from(new Set(ws))));
+
+  const controller = computeControllerGroups({
+    actors: Object.keys(actorStats),
+    linksByActor,
+    bioByActor,
+    handleStemByActor,
+    sharedFundersByWallet,
+    extraWalletsByActor,
+    minGroupSize: 3,
+  });
 
   const scorecards: ActorScorecard[] = Object.values(actorStats).map((stats) => {
     const coordinationScore = stats.totalActions > 0 ? Math.min(stats.burstActions / stats.totalActions, 1) : 0;
@@ -502,8 +621,11 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
       bottySessionScore: 0,
     };
 
+    const jacc = maxJaccardByActor.get(stats.actor) ?? { score: 0, peer: '' };
+    const seedProximityScore = seedProximity.get(stats.actor) ?? 0;
+
     // Extra mini-app style risk boosters (kept additive + clamped for backwards compatibility)
-    const sharedWalletScore = (sharedWallets.get(stats.actor)?.length ?? 0) > 0 ? 1 : 0;
+    const sharedWalletScore = (sharedFundersByWallet.get(stats.actor)?.length ?? 0) > 0 ? 1 : 0;
     const crossAppScore = (crossAppLinks.get(stats.actor)?.length ?? 0) > 1 ? 0.5 : 0;
     const sessionScore = session.bottySessionScore;
     const fraudScore = fraudulentTx.get(stats.actor) ?? 0;
@@ -514,6 +636,8 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
         0.05 * velocity.velocityScore +
         0.03 * ngram.repeatScore +
         0.03 * circadian.circadianScore +
+        0.05 * (jacc.score >= 0.85 && stats.uniqueTargets.size >= 3 ? Math.min((jacc.score - 0.85) / 0.15, 1) : 0) +
+        seedInfluence * seedProximityScore +
         0.05 * sharedWalletScore +
         0.05 * crossAppScore +
         0.05 * sessionScore +
@@ -539,8 +663,10 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
     if (velocity.velocityScore >= 0.7) reasons.push(`High velocity (${velocity.maxInWindow} in ${Math.max(1, settings.velocityWindowSeconds)}s)`);
     if (ngram.repeatScore >= 0.7 && ngram.topNgram) reasons.push(`Script-like sequence (${ngram.topNgram})`);
     if (circadian.circadianScore >= 0.8) reasons.push(`Unnatural circadian pattern (active hours ${circadian.activeHours})`);
+    if (jacc.score >= 0.85 && stats.uniqueTargets.size >= 3 && jacc.peer) reasons.push(`Very similar targets to ${jacc.peer} (Jaccard ${jacc.score.toFixed(2)})`);
+    if (seedInfluence > 0 && seedProximityScore >= 0.5) reasons.push(`Near confirmed sybil(s) (seed proximity ${seedProximityScore.toFixed(2)})`);
     if (stats.totalActions >= settings.entropyMinTotalActions && lowEntropyScore >= 0.7) reasons.push(`Low target entropy (${ent.toFixed(2)})`);
-    if (sharedWallets.get(stats.actor)?.length) reasons.push(`Shared funders (${sharedWallets.get(stats.actor)!.length})`);
+    if (sharedFundersByWallet.get(stats.actor)?.length) reasons.push(`Shared funders (${sharedFundersByWallet.get(stats.actor)!.length})`);
     if (crossAppLinks.get(stats.actor)?.length) reasons.push(`Cross-app activity (${crossAppLinks.get(stats.actor)!.join(', ')})`);
     if (session.sessionCount > 5) reasons.push(`High session count (${session.sessionCount})`);
     if ((fraudulentTx.get(stats.actor) ?? 0) > 0.5) reasons.push(`Fraudulent transaction patterns (${(fraudulentTx.get(stats.actor) ?? 0).toFixed(2)})`);
@@ -583,7 +709,10 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
       avgSessionMinutes: session.avgSessionMinutes,
       avgSessionGapMinutes: session.avgGapMinutes,
       maxSessionGapMinutes: session.maxGapMinutes,
-      sharedWallets: sharedWallets.get(stats.actor) ?? [],
+      maxTargetJaccard: jacc.score,
+      topTargetJaccardActor: jacc.peer,
+      seedProximityScore,
+      sharedWallets: sharedFundersByWallet.get(stats.actor) ?? [],
       crossAppPlatforms: crossAppLinks.get(stats.actor) ?? [],
       sessionCount: session.sessionCount,
       fraudTxScore: fraudulentTx.get(stats.actor) ?? 0,
@@ -593,7 +722,27 @@ export function analyzeLogs(input: { logs: LogEntry[]; settings: AnalysisSetting
 
   report({ stage: 'scorecards', pct: 90 });
   report({ stage: 'done', pct: 100 });
-  return { elements, clusters, waves, scorecards };
+  // Attach controller/linking info to scorecards
+  const controllerIdByActor = controller.controllerIdByActor;
+  const controllerSizeById = new Map<number, number>();
+  const controllerById = new Map<number, ControllerGroup>();
+  controller.groups.forEach((g) => {
+    controllerSizeById.set(g.controllerId, g.members.length);
+    controllerById.set(g.controllerId, g);
+  });
+  scorecards.forEach((s) => {
+    const id = controllerIdByActor.get(s.actor);
+    if (id === undefined) return;
+    const size = controllerSizeById.get(id) || 0;
+    const g = controllerById.get(id);
+    s.controllerId = id;
+    s.controllerGroupSize = size;
+    s.controllerScore = g?.score;
+    s.controllerEvidence = g?.evidence;
+    if (size >= 3) s.reasons.push(`Likely same controller (#${id}, size ${size})`);
+  });
+
+  return { elements, clusters, waves, scorecards, controllers: controller.groups };
 }
 
 export function detectSharedWallets(logs: LogEntry[]): Map<string, string[]> {

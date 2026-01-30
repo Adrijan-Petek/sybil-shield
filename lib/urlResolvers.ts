@@ -91,6 +91,29 @@ export function resolveUrlVariants(rawUrl: string): ResolvedUrl[] {
     }
   }
 
+  // Google Sheets export (CSV)
+  // https://docs.google.com/spreadsheets/d/{id}/edit#gid=0 -> /export?format=csv&gid=0
+  if (hostname === 'docs.google.com') {
+    const m = path.match(/^\/spreadsheets\/d\/([^/]+)\//);
+    const id = m?.[1];
+    if (id) {
+      const gid = url.hash?.includes('gid=') ? url.hash.split('gid=')[1]?.split('&')[0] : url.searchParams.get('gid');
+      const exportUrl = new URL(`https://docs.google.com/spreadsheets/d/${encodeURIComponent(id)}/export`);
+      exportUrl.searchParams.set('format', 'csv');
+      if (gid) exportUrl.searchParams.set('gid', gid);
+      out.push({ url: exportUrl.toString(), reason: 'gsheets-export-csv' });
+    }
+  }
+
+  // Pastebin raw
+  // https://pastebin.com/{id} -> https://pastebin.com/raw/{id}
+  if (hostname === 'pastebin.com') {
+    const parts = path.split('/').filter(Boolean);
+    if (parts.length === 1) {
+      out.push({ url: `https://pastebin.com/raw/${encodeURIComponent(parts[0])}`, reason: 'pastebin-raw' });
+    }
+  }
+
   // OneDrive: add download=1 (many share links respect this, including 1drv.ms after redirect)
   if (hostname === '1drv.ms' || hostname.endsWith('onedrive.live.com')) {
     out.push({ url: withSearchParam(url, 'download', '1').toString(), reason: 'onedrive-download-1' });
@@ -113,4 +136,3 @@ export function resolveUrlVariants(rawUrl: string): ResolvedUrl[] {
   }
   return uniq;
 }
-

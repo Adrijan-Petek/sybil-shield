@@ -22,12 +22,13 @@ This project focuses on signals that are **harder to fake** without losing the a
 - **Data**: upload logs, fetch GitHub, import URLs, scan profile pages for data files
 - **Generator**: create synthetic attack data for testing
 - **Analysis**: settings + scoring explanation
-- **Assistant**: AI-powered Q&A for interpreting signals
+- **Assistant**: local-first Q&A for interpreting signals (no external APIs)
 - **Graph**: interaction visualization
 - **Results**: clusters, waves, searchable actor scorecards with "why flagged"
 - **Review**: human review mode with confirm/dismiss and notes (IndexedDB storage)
 - **Evidence**: copy/download the full JSON evidence pack
 - **Mini-App**: dedicated stats and top risks for mini-app Sybil detection (shared wallets, cross-app activity, sessions, fraud, rapid actions, entropy)
+- **History**: local audit trail of runs/imports/scans/exports (IndexedDB)
 
 ## Quickstart
 
@@ -57,6 +58,7 @@ Paste any text containing links (chat messages, docs, issues). The server:
 - downloads `.csv` / `.json` (size-limited) and ingests as events
 
 Resolvers include GitHub (blob→raw), Gist (→/raw), GitLab (blob→raw), Bitbucket (`raw=1`), Google Drive (direct download), Dropbox (`dl=1`), OneDrive (`download=1`), HuggingFace (blob→resolve).
+Also supports Google Sheets export (CSV) and Pastebin raw links.
 
 ### 3) Scan profile links (auto-find CSV/JSON)
 
@@ -94,8 +96,9 @@ Optional (used by extra signals if provided):
 The Evidence pack includes:
 
 - `clusters`: connected components + density/conductance metrics
-- `waves`: burst events per **action + target** in fixed time bins
-- `scorecards`: per-actor scores + link stats + "why flagged" reasons (now includes shared wallets, cross-app platforms, session count, fraud score)
+- `waves`: burst events per **action + target** in fixed bins **and** sliding-window bursts (harder to evade)
+- `controllers`: multi-account “likely same operator” groups (entity resolution across platforms/wallets/links)
+- `scorecards`: per-actor scores + link stats + "why flagged" reasons (now includes velocity, action-sequence repetition, circadian anomalies, controller id/evidence)
 - `profileLinks`: all scanned links per actor (suspicious/shared)
 - `insights`: top targets, top suspicious domains, shared links, handle patterns, top waves
 
@@ -119,6 +122,34 @@ These help catch campaigns where many accounts drive traffic to the same scam en
 
 ### Coordination and manipulation
 
+Sybil attackers often avoid fixed bins by spreading actions right over the boundary. Sybil Shield includes:
+
+- **Fixed-bin waves** (fast baseline)
+- **Sliding-window bursts** (catches boundary-straddling coordination)
+- **Velocity** (N actions within N seconds)
+- **Action sequence repetition** (script-like n-grams)
+- **Circadian anomalies** (sustained 24/7 activity or tight high-volume windows)
+
+### Controller / entity resolution (multi-account linking)
+
+To uncover “many accounts / many wallets” controlled by one operator, the analyzer builds **controller groups** using high-signal overlaps:
+
+- Same wallet disclosed/used across profiles
+- Common funder patterns onchain (seed wallet → many wallets)
+- Shared links and uncommon shared domains across profiles
+- Same handle across platforms (e.g., `github:alice`, `twitter:alice`)
+- Large handle-stem clusters (template reuse)
+
+These groups are **not accusations** — they’re ranked leads for human review and evidence export.
+
+### Semi-supervised “seed” expansion (human-in-the-loop)
+
+If you confirm a handful of accounts as Sybil in **Review** (set decision to `confirm_sybil`) and rerun analysis, Sybil Shield can **propagate suspicion** to nearby accounts in the interaction graph with a configurable hop limit and influence. This helps uncover “support” accounts around a core farm without relying on paid APIs.
+
+### Cross-actor similarity (same-target overlap)
+
+Sybil farms often reuse the same playbook and hit the same targets. Sybil Shield computes per-actor **max target-set Jaccard similarity** to surface accounts that behave like duplicates (useful for ranking manipulation and mini-app reward farming).
+
 - **Waves**: many actions in the same time bin, on the same target
 - **Churn**: heavy `unfollow/unstar` behavior
 - **Low target diversity**: actions concentrated on a small number of targets
@@ -136,6 +167,17 @@ These help catch campaigns where many accounts drive traffic to the same scam en
 - **Cross-app linking**: actors active across multiple platforms
 - **Session anomalies**: high number of short sessions (bursts)
 - **Fraudulent transactions**: unusual amount patterns (high variance or uniform small amounts)
+
+### Added Detection Functions
+
+The following functions have been added to `lib/analyze.ts` for enhanced detection:
+
+- `detectSharedWallets(logs)`: Maps actors to shared wallet addresses from meta fields.
+- `detectCrossAppLinking(logs)`: Identifies actors active on multiple platforms.
+- `detectSessionAnomalies(logs, thresholdMs)`: Counts sessions based on time gaps, flagging high session counts.
+- `detectFraudulentTransactions(logs)`: Analyzes transaction amounts for anomalies like high variance.
+
+These are integrated into the scoring model with weights for sharedWalletScore, crossAppScore, sessionScore, and fraudScore.
 
 ## Threat model and boundaries
 
@@ -160,11 +202,13 @@ These help catch campaigns where many accounts drive traffic to the same scam en
 ## Project structure
 
 - `app/page.tsx` – UI + analysis pipeline (tabs, scoring, evidence)
-- `lib/analyze.ts` – core analysis engine (clustering, waves, scoring, mini-app detections)
-- `lib/profile.ts` – profile link extraction + anomaly scoring
+- `lib/analyze.ts` – core analysis engine (clustering, waves, scoring, mini-app detections: detectSharedWallets, detectCrossAppLinking, detectSessionAnomalies, detectFraudulentTransactions)
+- `lib/profile.ts` – profile link extraction + anomaly scoring (expanded suspicious domains)
 - `lib/urlResolvers.ts` – URL extraction + share-link → raw download resolver
-- `lib/scam.ts` – handle pattern signals + phishing-like URL heuristics
+- `lib/scam.ts` – handle pattern signals + phishing-like URL heuristics (enhanced for mini-apps)
 - `lib/reviewStore.ts` – IndexedDB-based human review storage
+- `lib/auditStore.ts` – local audit trail for runs/imports/scans/exports
+- `lib/rateLimit.ts` – rate limiting utilities for API routes
 - `app/workers/analyzeWorker.ts` – Web Worker for offloading analysis
 - `app/api/import/url/route.ts` – import CSV/JSON from URLs (SSRF-safe, size limited)
 - `app/api/scan/links/route.ts` – scan pages to discover CSV/JSON links

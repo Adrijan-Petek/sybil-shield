@@ -8,7 +8,7 @@ import type { ElementDefinition, NodeSingular } from 'cytoscape';
 import { normalizeLinks } from '../lib/profile';
 import { extractUrlsFromText } from '../lib/urlResolvers';
 import { computeHandlePatternScores } from '../lib/scam';
-import type { AnalysisSettings, ActorScorecard, DetailedCluster, LogEntry, WaveResult } from '../lib/analyze';
+import type { AnalysisSettings, ActorScorecard, ControllerGroup, DetailedCluster, LogEntry, WaveResult } from '../lib/analyze';
 import type { ReviewDecision } from '../lib/reviewStore';
 import { deleteReview, getAllReviews, upsertReview } from '../lib/reviewStore';
 import { addAuditEvent, clearAuditEvents, getRecentAuditEvents } from '../lib/auditStore';
@@ -28,6 +28,7 @@ export default function Home() {
   const [clusters, setClusters] = useState<DetailedCluster[]>([]);
   const [waves, setWaves] = useState<WaveResult[]>([]);
   const [scorecards, setScorecards] = useState<ActorScorecard[]>([]);
+  const [controllers, setControllers] = useState<ControllerGroup[]>([]);
   const [settings, setSettings] = useState<AnalysisSettings>({
     threshold: 0.6,
     minClusterSize: 6,
@@ -45,6 +46,8 @@ export default function Home() {
     velocityMaxActionsInWindow: 20,
     sessionGapMinutes: 5,
     actionNgramSize: 3,
+    seedInfluence: 0.15,
+    seedMaxHops: 2,
   });
   const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
   const [fileUploaded, setFileUploaded] = useState(false);
@@ -101,6 +104,7 @@ export default function Home() {
 
   const [reviews, setReviews] = useState<Record<string, { decision: ReviewDecision | ''; note?: string; updatedAt: string }>>({});
   const [reviewsLoading, setReviewsLoading] = useState(true);
+  const [useReviewSeeds, setUseReviewSeeds] = useState(true);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [analysisProgress, setAnalysisProgress] = useState<{ stage: string; pct: number } | null>(null);
   const [analysisRequestId, setAnalysisRequestId] = useState<string | null>(null);
@@ -328,20 +332,20 @@ export default function Home() {
         },
       ]),
     );
-
-	    return {
-	      exportedAt: new Date().toISOString(),
-	      settings,
-	      insights,
-	      auditTrail: auditEvents,
-	      reviews,
-	      clusters,
-	      waves,
-	      scorecards: flaggedScorecards,
+    return {
+      exportedAt: new Date().toISOString(),
+      settings,
+      insights,
+      auditTrail: auditEvents,
+      reviews,
+      clusters,
+      waves,
+      controllers,
+      scorecards: flaggedScorecards,
       profileLinks,
       syntheticGroundTruth: syntheticGroundTruth ?? undefined,
     };
-	  }, [auditEvents, clusters, insights, reviews, scorecards, flaggedScorecards, settings, syntheticGroundTruth, waves]);
+  }, [auditEvents, clusters, controllers, insights, reviews, scorecards, flaggedScorecards, settings, syntheticGroundTruth, waves]);
 
   const evidenceJson = useMemo(() => JSON.stringify(evidenceObject, null, 2), [evidenceObject]);
   const evidenceSummary = useMemo(() => {
@@ -354,10 +358,11 @@ export default function Home() {
 
     const lines: string[] = [];
     lines.push(`Sybil Shield Summary`);
-    lines.push(`- Events: ${logSummary.total.toLocaleString()} · Actors: ${logSummary.uniqueActors.toLocaleString()} · Targets: ${logSummary.uniqueTargets.toLocaleString()}`);
-    lines.push(`- Flagged actors: ${flagged.toLocaleString()} (threshold ${settings.threshold.toFixed(2)})`);
-    lines.push(`- Clusters: ${clustersN.toLocaleString()} · Waves: ${wavesN.toLocaleString()} (bin ${settings.timeBinMinutes}m, minActors ${settings.waveMinActors}, minCount ${settings.waveMinCount})`);
-    if (topWave) lines.push(`- Largest wave: ${topWave.action} on ${topWave.target} @ ${topWave.windowStart} (${topWave.actors} actors)`);
+	    lines.push(`- Events: ${logSummary.total.toLocaleString()} · Actors: ${logSummary.uniqueActors.toLocaleString()} · Targets: ${logSummary.uniqueTargets.toLocaleString()}`);
+	    lines.push(`- Flagged actors: ${flagged.toLocaleString()} (threshold ${settings.threshold.toFixed(2)})`);
+	    lines.push(`- Clusters: ${clustersN.toLocaleString()} · Waves: ${wavesN.toLocaleString()} (bin ${settings.timeBinMinutes}m, minActors ${settings.waveMinActors}, minCount ${settings.waveMinCount})`);
+	    lines.push(`- Likely controllers: ${controllers.length.toLocaleString()} group(s) (min size 3)`);
+	    if (topWave) lines.push(`- Largest wave: ${topWave.action} on ${topWave.target} @ ${topWave.windowStart} (${topWave.actors} actors)`);
     if (topChurnTarget) lines.push(`- Top churn target: ${topChurnTarget.key} (${topChurnTarget.count} churn events)`);
     if (topSuspDomain) lines.push(`- Top suspicious domain: ${topSuspDomain.key} (seen in ${topSuspDomain.count} profiles)`);
     lines.push('');
@@ -366,9 +371,10 @@ export default function Home() {
     lines.push('- Check Graph for tight clusters and verify whether they have low external edges.');
     lines.push('- Export the evidence pack once reviewed (includes reviews + insights).');
     return lines.join('\n');
-  }, [
-    clusters.length,
-    flaggedScorecards.length,
+	  }, [
+	    clusters.length,
+	    controllers.length,
+	    flaggedScorecards.length,
     insights.topSuspiciousDomains,
     insights.topTargetsByChurn,
     insights.topWaves,
@@ -379,8 +385,8 @@ export default function Home() {
     settings.timeBinMinutes,
     settings.waveMinActors,
     settings.waveMinCount,
-    waves.length,
-  ]);
+	    waves.length,
+	  ]);
 
   const syntheticMetrics = useMemo(() => {
     if (!syntheticGroundTruth || syntheticGroundTruth.sybilActors.length === 0) return null;
@@ -743,18 +749,26 @@ export default function Home() {
     setSourceError(null);
     setSourceStatus('Analyzing…');
     setResultsPage(1);
+
+    const seedActors = useReviewSeeds
+      ? Object.entries(reviews)
+          .filter(([, r]) => r.decision === 'confirm_sybil')
+          .map(([actor]) => actor)
+      : [];
+    const settingsToSend: AnalysisSettings = { ...settings, seedActors };
+
     void addAuditEvent({
       type: 'analysis_run',
       at: new Date().toISOString(),
       summary: `Analysis run: ${data.length.toLocaleString()} events, threshold ${settings.threshold.toFixed(2)}`,
-      meta: { count: data.length, settings },
+      meta: { count: data.length, settings, seedActorsCount: seedActors.length },
     }).then(refreshAudit);
 
     type WorkerProgress = { type: 'progress'; requestId: string; stage: string; pct: number };
     type WorkerResult = {
       type: 'result';
       requestId: string;
-      result: { elements: ElementDefinition[]; clusters: DetailedCluster[]; waves: WaveResult[]; scorecards: ActorScorecard[] };
+      result: { elements: ElementDefinition[]; clusters: DetailedCluster[]; waves: WaveResult[]; scorecards: ActorScorecard[]; controllers: ControllerGroup[] };
     };
     type WorkerError = { type: 'error'; requestId: string; error: string };
     type WorkerMsg = WorkerProgress | WorkerResult | WorkerError;
@@ -773,6 +787,7 @@ export default function Home() {
         setClusters(msg.result.clusters || []);
         setWaves(msg.result.waves || []);
         setScorecards(msg.result.scorecards || []);
+        setControllers(msg.result.controllers || []);
         setIsAnalyzing(false);
         setAnalysisProgress({ stage: 'done', pct: 100 });
         setSourceStatus('Analysis complete');
@@ -793,7 +808,7 @@ export default function Home() {
 
     analysisWorker.addEventListener('message', onMessage);
     analysisListenerRef.current = onMessage;
-    analysisWorker.postMessage({ type: 'analyze', requestId, logs: data, settings });
+    analysisWorker.postMessage({ type: 'analyze', requestId, logs: data, settings: settingsToSend });
   };
 
   const appendLogs = (newLogs: LogEntry[], label: string) => {
@@ -1108,17 +1123,18 @@ export default function Home() {
                 {theme === 'dark' ? 'Black' : 'Dim'}
               </button>
               <button
-                onClick={() => {
-                  setLogs([]);
-                  setElements([]);
-                  setClusters([]);
-                  setWaves([]);
-                  setScorecards([]);
-                  setFileUploaded(false);
-                  setSourceStatus(null);
-                  setSourceError(null);
-                  setActiveTab('dashboard');
-                }}
+	                onClick={() => {
+	                  setLogs([]);
+	                  setElements([]);
+	                  setClusters([]);
+	                  setWaves([]);
+	                  setScorecards([]);
+	                  setControllers([]);
+	                  setFileUploaded(false);
+	                  setSourceStatus(null);
+	                  setSourceError(null);
+	                  setActiveTab('dashboard');
+	                }}
                 className="px-3 py-2 rounded-md border border-slate-800 bg-slate-950/40 text-sm text-slate-200 hover:bg-slate-900/50"
               >
                 Reset
@@ -1858,6 +1874,8 @@ export default function Home() {
 	                      velocityMaxActionsInWindow: 25,
 	                      sessionGapMinutes: 5,
 	                      actionNgramSize: 3,
+	                      seedInfluence: 0.15,
+	                      seedMaxHops: 2,
 	                      positiveActions: Array.from(
 	                        new Set([
 	                          ...s.positiveActions,
@@ -1871,9 +1889,9 @@ export default function Home() {
                           'transfer',
                         ]),
                       ),
-                      churnActions: Array.from(new Set([...s.churnActions, 'unclaim', 'unlike', 'revoke'])),
-                    }))
-                  }
+	                      churnActions: Array.from(new Set([...s.churnActions, 'unclaim', 'unlike', 'revoke'])),
+	                    }))
+	                  }
                   className="px-3 py-2 rounded-md border border-slate-800 bg-black/40 text-sm text-slate-200 hover:bg-slate-900/50"
                   title="Good defaults for high-volume mini-app/bot logs (1-minute bins + rapid/entropy signals)"
                 >
@@ -2054,6 +2072,42 @@ export default function Home() {
                           className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
                         />
                       </label>
+                      <div className="md:col-span-2 border-t border-slate-800 pt-3">
+                        <div className="text-sm text-slate-200 font-medium">Use confirmed sybils as seeds</div>
+                        <div className="mt-2 flex flex-wrap items-center gap-3">
+                          <label className="text-xs text-slate-300 flex items-center gap-2">
+                            <input type="checkbox" checked={useReviewSeeds} onChange={(e) => setUseReviewSeeds(e.target.checked)} />
+                            Enable seed propagation (from Review tab)
+                          </label>
+                          <label className="text-xs text-slate-300 flex items-center gap-2">
+                            Influence
+                            <input
+                              type="number"
+                              min={0}
+                              max={1}
+                              step={0.05}
+                              value={settings.seedInfluence}
+                              onChange={(e) => setSettings((s) => ({ ...s, seedInfluence: Math.max(0, Math.min(1, Number.parseFloat(e.target.value || '0') || 0)) }))}
+                              className="w-20 border border-slate-800 bg-slate-950/60 rounded px-2 py-1 text-xs text-slate-100"
+                            />
+                          </label>
+                          <label className="text-xs text-slate-300 flex items-center gap-2">
+                            Max hops
+                            <input
+                              type="number"
+                              min={0}
+                              max={4}
+                              step={1}
+                              value={settings.seedMaxHops}
+                              onChange={(e) => setSettings((s) => ({ ...s, seedMaxHops: Math.max(0, Math.min(4, Number.parseInt(e.target.value || '0', 10) || 0)) }))}
+                              className="w-16 border border-slate-800 bg-slate-950/60 rounded px-2 py-1 text-xs text-slate-100"
+                            />
+                          </label>
+                          <div className="text-xs text-slate-500">
+                            Tip: mark a few accounts as <code>confirm_sybil</code>, rerun analysis, and we’ll boost nearby accounts in the interaction graph.
+                          </div>
+                        </div>
+                      </div>
                     </div>
                     <div className="mt-2 text-xs text-slate-500">
                       Tip: burst/velocity/sequences help detect bots and coordinated mini-app farms even when they avoid fixed time bins.
@@ -2247,7 +2301,7 @@ export default function Home() {
               </ul>
             </Card>
 
-            <Card title="Waves" subtitle="Fixed bins + sliding-window bursts">
+	            <Card title="Waves" subtitle="Fixed bins + sliding-window bursts">
               <ul className="text-sm text-slate-200 list-disc pl-4 space-y-1">
                 {waves.length === 0 && <li className="list-none text-slate-500">No waves yet.</li>}
                 {waves
@@ -2262,9 +2316,47 @@ export default function Home() {
                 ))}
                 {waves.length > 80 && <li className="list-none text-xs text-slate-500">Showing top 80 waves by z-score.</li>}
               </ul>
-            </Card>
+	            </Card>
 
-            <Card title="Actor scorecards" subtitle="Searchable, explainable reasons">
+              <Card title="Likely controllers" subtitle="Multiple accounts likely controlled by the same operator">
+                <div className="text-xs text-slate-400">
+                  Groups: <span className="text-slate-200">{controllers.length.toLocaleString()}</span> · min size 3
+                </div>
+                <ul className="mt-3 space-y-2 max-h-[360px] overflow-y-auto">
+                  {controllers.length === 0 && <li className="text-slate-500">Run analysis to generate controller groups.</li>}
+                  {controllers.slice(0, 20).map((g) => (
+                    <li key={g.controllerId} className="border border-slate-800 bg-black/40 rounded-lg p-3">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="text-sm font-medium text-slate-100">#{g.controllerId}</div>
+                        <div className="text-xs text-slate-300">
+                          score {g.score.toFixed(2)} · members {g.members.length}
+                        </div>
+                      </div>
+                      {g.evidence.length > 0 && (
+                        <ul className="mt-2 text-xs text-slate-300 list-disc pl-4">
+                          {g.evidence.slice(0, 4).map((e) => (
+                            <li key={e}>{e}</li>
+                          ))}
+                        </ul>
+                      )}
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        <button
+                          onClick={async () => {
+                            await navigator.clipboard.writeText(g.members.join('\n'));
+                            setSourceStatus(`Copied controller #${g.controllerId} members`);
+                          }}
+                          className="px-2 py-1 rounded border border-slate-800 bg-black/40 text-xs text-slate-200"
+                        >
+                          Copy members
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                  {controllers.length > 20 && <li className="text-xs text-slate-500">Showing top 20 groups.</li>}
+                </ul>
+              </Card>
+
+	            <Card title="Actor scorecards" subtitle="Searchable, explainable reasons">
               <div className="flex flex-col md:flex-row md:items-center gap-2 md:justify-between">
                 <label className="text-sm text-slate-200">
                   <input type="checkbox" className="mr-2" checked={showAllActors} onChange={(e) => setShowAllActors(e.target.checked)} />
@@ -2305,14 +2397,19 @@ export default function Home() {
                   .map((s) => (
                     <li key={s.actor} className="border border-slate-800 bg-slate-950/30 rounded-lg p-3">
                       <div className="flex items-start justify-between gap-3">
-                        <div className="font-medium flex items-center gap-2">
-                          <span>{s.actor}</span>
-                          {reviews[s.actor]?.decision && (
+	                        <div className="font-medium flex items-center gap-2">
+	                          <span>{s.actor}</span>
+                          {s.controllerId !== undefined && (s.controllerGroupSize || 0) >= 3 && (
                             <span className="text-[10px] px-2 py-0.5 rounded-full border border-slate-700 text-slate-300">
-                              {reviews[s.actor].decision}
+                              ctrl #{s.controllerId} · {s.controllerGroupSize}
                             </span>
                           )}
-                        </div>
+	                          {reviews[s.actor]?.decision && (
+	                            <span className="text-[10px] px-2 py-0.5 rounded-full border border-slate-700 text-slate-300">
+	                              {reviews[s.actor].decision}
+	                            </span>
+	                          )}
+	                        </div>
                         <div className="text-sm">
                           Score <span className="font-semibold">{s.sybilScore.toFixed(2)}</span>
                         </div>
@@ -2321,12 +2418,15 @@ export default function Home() {
                         <div>
                           Core: churn {s.churnScore} · coord {s.coordinationScore.toFixed(2)} · burst {s.burstRate.toFixed(2)} · diversity {s.lowDiversityScore.toFixed(2)} · cluster {s.clusterIsolationScore.toFixed(2)}
                         </div>
-                        <div>
-                          Mini-app: rapid {s.maxActionsPerMinute}/min · velocity {s.maxActionsPerVelocityWindow} in {settings.velocityWindowSeconds}s · seq {s.actionSequenceRepeatScore.toFixed(2)} · sessions {s.sessionCount} · hours {s.activeHours}
-                        </div>
-                        <div>
-                          Profile/graph: links {s.links.length} · bio {s.bioSimilarityScore.toFixed(2)} · handle {s.handlePatternScore.toFixed(2)} · phish {s.phishingLinkScore.toFixed(2)} · PR {s.pagerank.toFixed(4)} · betw {s.betweenness.toFixed(2)}
-                        </div>
+	                        <div>
+	                          Mini-app: rapid {s.maxActionsPerMinute}/min · velocity {s.maxActionsPerVelocityWindow} in {settings.velocityWindowSeconds}s · seq {s.actionSequenceRepeatScore.toFixed(2)} · sessions {s.sessionCount} · hours {s.activeHours}
+	                        </div>
+	                        <div>
+	                          Linking: ctrl {s.controllerId ?? '-'} · jacc {s.maxTargetJaccard.toFixed(2)}{s.topTargetJaccardActor ? ` (${s.topTargetJaccardActor})` : ''} · seed {s.seedProximityScore.toFixed(2)}
+	                        </div>
+	                        <div>
+	                          Profile/graph: links {s.links.length} · bio {s.bioSimilarityScore.toFixed(2)} · handle {s.handlePatternScore.toFixed(2)} · phish {s.phishingLinkScore.toFixed(2)} · PR {s.pagerank.toFixed(4)} · betw {s.betweenness.toFixed(2)}
+	                        </div>
                       </div>
                       {s.reasons.length > 0 && (
                         <div className="mt-2 text-xs text-slate-200">
@@ -2334,6 +2434,16 @@ export default function Home() {
                           <ul className="mt-1 list-disc pl-4">
                             {s.reasons.slice(0, 6).map((r) => (
                               <li key={r}>{r}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {s.controllerEvidence && s.controllerEvidence.length > 0 && (
+                        <div className="mt-2 text-xs text-slate-300">
+                          <div className="text-slate-400">Controller evidence</div>
+                          <ul className="mt-1 list-disc pl-4">
+                            {s.controllerEvidence.slice(0, 2).map((e) => (
+                              <li key={e}>{e}</li>
                             ))}
                           </ul>
                         </div>
@@ -2400,15 +2510,15 @@ export default function Home() {
 
         {activeTab === 'miniapp' && (
           <div className="space-y-6">
-	            <Card title="Mini-App Protection" subtitle="Enhanced detection for mini-app Sybil attacks (rapid interactions, wallet clusters, cross-app linking)">
-	              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-	                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
-	                  <h3 className="text-sm font-semibold text-slate-100">Shared Funders</h3>
-	                  <p className="text-xs text-slate-300 mt-1">Wallets funded by the same source</p>
-	                  <div className="mt-2 text-lg font-bold text-slate-100">
-	                    {scorecards.filter(s => s.sharedWallets.length > 0).length}
-	                  </div>
-	                </div>
+            <Card title="Mini-App Protection" subtitle="Enhanced detection for mini-app Sybil attacks (rapid interactions, wallet clusters, cross-app linking)">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
+                  <h3 className="text-sm font-semibold text-slate-100">Shared Funders</h3>
+                  <p className="text-xs text-slate-300 mt-1">Wallets funded by the same source</p>
+                  <div className="mt-2 text-lg font-bold text-slate-100">
+                    {scorecards.filter(s => s.sharedWallets.length > 0).length}
+                  </div>
+                </div>
                 <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
                   <h3 className="text-sm font-semibold text-slate-100">Cross-App Activity</h3>
                   <p className="text-xs text-slate-300 mt-1">Actors active on multiple platforms</p>
@@ -2458,15 +2568,22 @@ export default function Home() {
 	                    {scorecards.filter(s => s.circadianScore >= 0.8).length}
 	                  </div>
 	                </div>
-	                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
-	                  <h3 className="text-sm font-semibold text-slate-100">Low Target Entropy</h3>
-	                  <p className="text-xs text-slate-300 mt-1">Focused on few targets</p>
-	                  <div className="mt-2 text-lg font-bold text-slate-100">
-	                    {scorecards.filter(s => s.lowEntropyScore > 0.7).length}
-	                  </div>
-	                </div>
-	              </div>
-	            </Card>
+                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
+                  <h3 className="text-sm font-semibold text-slate-100">Low Target Entropy</h3>
+                  <p className="text-xs text-slate-300 mt-1">Focused on few targets</p>
+                  <div className="mt-2 text-lg font-bold text-slate-100">
+                    {scorecards.filter(s => s.lowEntropyScore > 0.7).length}
+                  </div>
+                </div>
+                <div className="bg-black/50 border border-slate-800 rounded-lg p-3">
+                  <h3 className="text-sm font-semibold text-slate-100">Likely Controllers</h3>
+                  <p className="text-xs text-slate-300 mt-1">Merged multi-account groups</p>
+                  <div className="mt-2 text-lg font-bold text-slate-100">
+                    {controllers.length}
+                  </div>
+                </div>
+              </div>
+            </Card>
             <Card title="Top Mini-App Risks" subtitle="Actors with highest mini-app specific scores">
               <ul className="space-y-2">
                 {scorecards

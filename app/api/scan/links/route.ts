@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
 import { extractUrlsFromText, resolveUrlVariants } from '../../../../lib/urlResolvers';
 import { rateLimit } from '../../../../lib/rateLimit';
+import { safeFetchTextWithLimit } from '../../../../lib/safeFetch';
 
 type ScanRequestBody = {
   urls?: unknown;
@@ -78,16 +79,8 @@ function resolveAgainstBase(baseUrl: string, maybeRelative: string): string | nu
 }
 
 async function fetchTextWithLimit(url: string): Promise<{ contentType: string; text: string }> {
-  const res = await fetch(url, { cache: 'no-store' });
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Fetch failed (${res.status}): ${text || res.statusText}`);
-  }
-  const contentType = res.headers.get('content-type') || '';
-  const buf = await res.arrayBuffer();
-  if (buf.byteLength > MAX_BYTES) throw new Error(`Response too large (>${MAX_BYTES} bytes)`);
-  const text = new TextDecoder('utf-8').decode(buf);
-  return { contentType, text };
+  const res = await safeFetchTextWithLimit(url, { maxBytes: MAX_BYTES, timeoutMs: 12_000, userAgent: 'sybil-shield', allowHttp: true, maxRedirects: 3 });
+  return { contentType: res.contentType, text: res.text };
 }
 
 export async function POST(req: Request) {

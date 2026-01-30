@@ -3,6 +3,7 @@ import { computeSharedLinksByActor, isSuspiciousDomain, linkDiversityScore, norm
 import { extractUrlsFromText, resolveUrlVariants } from '../../../../lib/urlResolvers';
 import { handleStem, handleShape, isLikelyPhishingUrl } from '../../../../lib/scam';
 import { rateLimit } from '../../../../lib/rateLimit';
+import { safeFetchTextWithLimit } from '../../../../lib/safeFetch';
 
 type ScanRequestBody = {
   urls?: unknown;
@@ -40,17 +41,7 @@ function normalizeHttpUrl(raw: string): string | null {
 }
 
 async function fetchTextWithLimit(url: string): Promise<{ contentType: string; text: string; finalUrl: string }> {
-  const res = await fetch(url, { cache: 'no-store', redirect: 'follow', headers: { 'User-Agent': 'sybil-shield' } });
-  const finalUrl = res.url || url;
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`Fetch failed (${res.status}): ${text || res.statusText}`);
-  }
-  const contentType = res.headers.get('content-type') || '';
-  const buf = await res.arrayBuffer();
-  if (buf.byteLength > MAX_BYTES) throw new Error(`Response too large (>${MAX_BYTES} bytes)`);
-  const text = new TextDecoder('utf-8').decode(buf);
-  return { contentType, text, finalUrl };
+  return safeFetchTextWithLimit(url, { maxBytes: MAX_BYTES, timeoutMs: 12_000, userAgent: 'sybil-shield', allowHttp: true, maxRedirects: 3 });
 }
 
 function extractMetaContent(html: string, names: string[]): string | null {
@@ -104,6 +95,10 @@ function inferActorIdFromUrl(urlStr: string): string {
     if (host === 'talent.app' && parts.length >= 1) return `talent:${parts[parts.length - 1]}`;
     if (host === 'github.com' && parts.length >= 1) return `github:${parts[0]}`;
     if (host === 'warpcast.com' && parts.length >= 1) return `farcaster:${parts[0]}`;
+    if ((host === 'x.com' || host === 'twitter.com') && parts.length >= 1) return `twitter:${parts[0]}`;
+    if ((host === 't.me' || host === 'telegram.me') && parts.length >= 1) return `telegram:${parts[0]}`;
+    if (host === 'discord.gg' && parts.length >= 1) return `discord:${parts[0]}`;
+    if (host === 'lenster.xyz' && parts.length >= 1) return `lens:${parts[0]}`;
     return `${host}:${parts.join('/') || ''}`.replace(/:$/g, '');
   } catch {
     return urlStr;
