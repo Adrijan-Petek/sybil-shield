@@ -739,6 +739,42 @@ These reports can be exported as JSON for further analysis or reporting to platf
 - Arbitrum Sybil Detection
 - TrustaLabs Airdrop Sybil Identification
 
+## Future Enhancements
+
+Based on ongoing development, here are prioritized suggestions for expanding Sybil Shield's capabilities:
+
+### Advanced Analytics
+- **Time-Series Anomaly Detection**: Statistical models (e.g., ARIMA) for unusual activity spikes.
+- **Action Sequence Mining**: Markov chains for detecting scripted bot patterns.
+- **Graph Embeddings**: node2vec for similarity-based clustering.
+- **Community Detection**: Louvain/Leiden algorithms for hierarchical Sybil structures.
+
+### Machine Learning
+- **Unsupervised Anomaly Scoring**: Autoencoders for deviation detection.
+- **Supervised Classification**: User-labeled datasets for custom models.
+- **Explainable AI**: LIME/SHAP for ML prediction explanations.
+
+### Onchain Features
+- **Funding Tree Analysis**: Trace common funders in blockchain logs.
+- **Token Flow Graphs**: Directed graphs for transfer patterns.
+- **Gas Fee Anomalies**: Detect bots via transaction costs.
+
+### Cross-Platform
+- **Fuzzy Identity Matching**: Link similar handles across platforms.
+- **Multi-Platform Waves**: Coordinated attacks spanning services.
+
+### Performance & UX
+- **Incremental Analysis**: Re-analyze new data without full recomputation.
+- **Real-Time Alerts**: Notifications for high-risk detections.
+- **Custom Dashboards**: Personalized metric views.
+
+### Integrations
+- **API Connectors**: Real endpoints for Base, Farcaster, Talent.
+- **Plugin System**: Custom signal extensions.
+- **Webhook Notifications**: External alerts.
+
+For implementation, follow the Suggestion Workflow: design, implement, test, document, deploy.
+
 ## License
 
 MIT
