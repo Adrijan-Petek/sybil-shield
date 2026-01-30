@@ -18,9 +18,10 @@ const CytoscapeComponent = dynamic(() => import('react-cytoscapejs'), { ssr: fal
 
 type CsvRow = Record<string, string | undefined>;
 
-type TabKey = 'dashboard' | 'data' | 'generator' | 'analysis' | 'graph' | 'results' | 'review' | 'evidence';
+type TabKey = 'dashboard' | 'data' | 'generator' | 'analysis' | 'assistant' | 'graph' | 'results' | 'review' | 'evidence';
 
 export default function Home() {
+  const [theme, setTheme] = useState<'dark' | 'light'>('dark');
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [elements, setElements] = useState<ElementDefinition[]>([]);
   const [clusters, setClusters] = useState<DetailedCluster[]>([]);
@@ -95,6 +96,21 @@ export default function Home() {
   const analysisListenerRef = useRef<((ev: MessageEvent) => void) | null>(null);
   const [resultsPage, setResultsPage] = useState(1);
   const resultsPageSize = 50;
+
+  type AssistantMessage = { role: 'user' | 'assistant'; text: string; at: string };
+  const [assistantMessages, setAssistantMessages] = useState<AssistantMessage[]>([]);
+  const [assistantInput, setAssistantInput] = useState('');
+
+  useEffect(() => {
+    const saved = window.localStorage.getItem('sybilShieldTheme');
+    if (saved === 'light' || saved === 'dark') setTheme(saved);
+  }, []);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    root.dataset.theme = theme;
+    window.localStorage.setItem('sybilShieldTheme', theme);
+  }, [theme]);
 
   const TabButton = ({ tab, label }: { tab: TabKey; label: string }) => (
     <button
@@ -266,6 +282,226 @@ export default function Home() {
   }, [clusters, insights, reviews, scorecards, flaggedScorecards, settings, syntheticGroundTruth, waves]);
 
   const evidenceJson = useMemo(() => JSON.stringify(evidenceObject, null, 2), [evidenceObject]);
+  const evidenceSummary = useMemo(() => {
+    const flagged = flaggedScorecards.length;
+    const clustersN = clusters.length;
+    const wavesN = waves.length;
+    const topWave = insights.topWaves[0];
+    const topChurnTarget = insights.topTargetsByChurn[0];
+    const topSuspDomain = insights.topSuspiciousDomains[0];
+
+    const lines: string[] = [];
+    lines.push(`Sybil Shield Summary`);
+    lines.push(`- Events: ${logSummary.total.toLocaleString()} · Actors: ${logSummary.uniqueActors.toLocaleString()} · Targets: ${logSummary.uniqueTargets.toLocaleString()}`);
+    lines.push(`- Flagged actors: ${flagged.toLocaleString()} (threshold ${settings.threshold.toFixed(2)})`);
+    lines.push(`- Clusters: ${clustersN.toLocaleString()} · Waves: ${wavesN.toLocaleString()} (bin ${settings.timeBinMinutes}m, minActors ${settings.waveMinActors}, minCount ${settings.waveMinCount})`);
+    if (topWave) lines.push(`- Largest wave: ${topWave.action} on ${topWave.target} @ ${topWave.windowStart} (${topWave.actors} actors)`);
+    if (topChurnTarget) lines.push(`- Top churn target: ${topChurnTarget.key} (${topChurnTarget.count} churn events)`);
+    if (topSuspDomain) lines.push(`- Top suspicious domain: ${topSuspDomain.key} (seen in ${topSuspDomain.count} profiles)`);
+    lines.push('');
+    lines.push('Recommended next steps:');
+    lines.push('- Review the top flagged actors in Results and confirm/dismiss in Review tab.');
+    lines.push('- Check Graph for tight clusters and verify whether they have low external edges.');
+    lines.push('- Export the evidence pack once reviewed (includes reviews + insights).');
+    return lines.join('\n');
+  }, [
+    clusters.length,
+    flaggedScorecards.length,
+    insights.topSuspiciousDomains,
+    insights.topTargetsByChurn,
+    insights.topWaves,
+    logSummary.total,
+    logSummary.uniqueActors,
+    logSummary.uniqueTargets,
+    settings.threshold,
+    settings.timeBinMinutes,
+    settings.waveMinActors,
+    settings.waveMinCount,
+    waves.length,
+  ]);
+
+  const assistantKnowledge = useMemo(() => {
+    const entries: Array<{ title: string; patterns: string[]; answer: () => string }> = [
+      {
+        title: 'What does SybilScore mean?',
+        patterns: ['sybilscore', 'score', 'confidence'],
+        answer: () =>
+          [
+            'SybilScore is an explainable heuristic score (0–1) that aggregates multiple signals:',
+            '- coordinationScore: activity concentrated inside detected “wave” bins',
+            '- churnScore: unfollow/unstar volume',
+            '- clusterIsolationScore: low external connections relative to cluster size',
+            '- lowDiversityScore: many actions on few targets',
+            '- profileAnomalyScore: suspicious/shared links and follower/following ratio (if provided)',
+            '',
+            'Use it as a review prioritization signal, not an accusation.',
+          ].join('\n'),
+      },
+      {
+        title: 'Why was an actor flagged?',
+        patterns: ['why flagged', 'reason', 'reasons', 'flagged'],
+        answer: () =>
+          [
+            'Open the Results tab and expand an actor: “Why flagged” lists the strongest signals.',
+            'Common reasons:',
+            '- High coordination (burst actions in wave bins)',
+            '- High churn (unfollow/unstar)',
+            '- Cluster isolation (farm topology)',
+            '- Shared/suspicious links and repeated bios',
+            '- Handle pattern similarity (template reuse)',
+          ].join('\n'),
+      },
+      {
+        title: 'How should I set thresholds?',
+        patterns: ['threshold', 'tune', 'settings'],
+        answer: () => {
+          const flagged = flaggedScorecards.length;
+          const total = scorecards.length;
+          const ratio = total > 0 ? flagged / total : 0;
+          const lines = [
+            `Current threshold: ${settings.threshold.toFixed(2)}`,
+            `Flagged actors: ${flagged.toLocaleString()} / ${total.toLocaleString()}`,
+          ];
+          if (total === 0) {
+            lines.push('Load data and run analysis first.');
+            return lines.join('\n');
+          }
+          if (flagged === 0) {
+            lines.push('Suggestion: lower threshold (e.g. 0.6 → 0.5) or lower waveMinActors/waveMinCount to detect smaller coordinated waves.');
+          } else if (ratio > 0.25) {
+            lines.push('Suggestion: raise threshold (e.g. +0.05 to +0.15) and/or increase waveMinActors to reduce false positives.');
+          } else {
+            lines.push('Suggestion: keep threshold, then confirm/dismiss in Review tab to calibrate.');
+          }
+          return lines.join('\n');
+        },
+      },
+      {
+        title: 'What should I look at first?',
+        patterns: ['first', 'start', 'where', 'what next', 'triage'],
+        answer: () =>
+          [
+            'Triage order (fast → deep):',
+            '1) Dashboard insights: top targets, top waves, suspicious domains, shared links',
+            '2) Results: highest SybilScore actors and “Why flagged”',
+            '3) Graph: verify clusters (do the red nodes form tight components?)',
+            '4) Review: confirm/dismiss/escalate and export evidence',
+          ].join('\n'),
+      },
+      {
+        title: 'What does a wave mean?',
+        patterns: ['wave', 'burst', 'timing'],
+        answer: () =>
+          [
+            'A wave is a burst of the same action on the same target within a fixed time bin.',
+            'It’s useful for detecting coordinated campaigns (e.g., mass unfollow/unstar).',
+            'Tune it with:',
+            '- timeBinMinutes',
+            '- waveMinCount',
+            '- waveMinActors',
+          ].join('\n'),
+      },
+      {
+        title: 'How do link signals catch scammers?',
+        patterns: ['link', 'domain', 'phishing', 'scam'],
+        answer: () =>
+          [
+            'Scam campaigns often reuse the same domains/URLs across many accounts.',
+            'Sybil Shield flags:',
+            '- suspicious domains (shorteners + punycode/IP hosts)',
+            '- phishing-like URL structure (user@host, excessive subdomains, etc.)',
+            '- shared links across profiles',
+            '- low link diversity',
+          ].join('\n'),
+      },
+    ];
+    return entries;
+  }, [flaggedScorecards.length, scorecards.length, settings.threshold]);
+
+  const assistantAnswer = (question: string): string => {
+    const q = question.trim().toLowerCase();
+    if (!q) return 'Ask a question like: “Why was an actor flagged?” or “How should I set thresholds?”';
+
+    const tokens = new Set(q.split(/[^a-z0-9]+/g).filter(Boolean));
+    const scored = assistantKnowledge
+      .map((e) => {
+        const patternHits = e.patterns.reduce((sum, p) => sum + (q.includes(p) ? 3 : 0), 0);
+        const tokenHits = e.patterns.reduce((sum, p) => sum + (tokens.has(p) ? 1 : 0), 0);
+        return { e, score: patternHits + tokenHits };
+      })
+      .sort((a, b) => b.score - a.score);
+
+    const best = scored[0];
+    if (best && best.score > 0) return best.e.answer();
+
+    const summary = [
+      'I can help with:',
+      ...assistantKnowledge.map((e) => `- ${e.title}`),
+      '',
+      'Tip: If you paste a specific actor ID, I’ll tell you how to interpret their signals (use Results tab for exact “Why flagged”).',
+    ];
+    return summary.join('\n');
+  };
+
+  const assistantExplainCurrent = (): string => {
+    const lines: string[] = [];
+    lines.push('Current run summary:');
+    lines.push(`- Events: ${logSummary.total.toLocaleString()}`);
+    lines.push(`- Actors: ${logSummary.uniqueActors.toLocaleString()}`);
+    lines.push(`- Targets: ${logSummary.uniqueTargets.toLocaleString()}`);
+    lines.push(`- Flagged: ${flaggedScorecards.length.toLocaleString()} (threshold ${settings.threshold.toFixed(2)})`);
+    lines.push(`- Clusters: ${clusters.length.toLocaleString()}`);
+    lines.push(`- Waves: ${waves.length.toLocaleString()} (bin ${settings.timeBinMinutes}m, minActors ${settings.waveMinActors}, minCount ${settings.waveMinCount})`);
+
+    if (insights.topTargetsByChurn.length > 0) {
+      lines.push('');
+      lines.push('Top churn targets:');
+      insights.topTargetsByChurn.slice(0, 5).forEach((t) => lines.push(`- ${t.key} (${t.count})`));
+    }
+    if (insights.topSuspiciousDomains.length > 0) {
+      lines.push('');
+      lines.push('Top suspicious domains:');
+      insights.topSuspiciousDomains.slice(0, 5).forEach((d) => lines.push(`- ${d.key} (${d.count})`));
+    }
+    if (insights.topSharedLinks.length > 0) {
+      lines.push('');
+      lines.push('Top shared links:');
+      insights.topSharedLinks.slice(0, 3).forEach((l) => lines.push(`- ${l.key} (${l.count})`));
+    }
+    lines.push('');
+    lines.push('Next steps:');
+    lines.push('- Open Results to inspect top actors and “Why flagged”');
+    lines.push('- Use Review tab to confirm/dismiss and export evidence');
+    return lines.join('\n');
+  };
+
+  const temporalHeatmap = useMemo(() => {
+    // Top actions by frequency -> counts by UTC hour (0-23)
+    const actionCounts: Record<string, number> = {};
+    logs.forEach((l) => {
+      actionCounts[l.action] = (actionCounts[l.action] || 0) + 1;
+    });
+    const topActions = Object.entries(actionCounts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6)
+      .map(([action]) => action);
+
+    const matrix: Record<string, number[]> = {};
+    topActions.forEach((a) => (matrix[a] = Array.from({ length: 24 }, () => 0)));
+
+    for (const l of logs) {
+      if (!matrix[l.action]) continue;
+      const t = new Date(l.timestamp);
+      const h = Number.isFinite(t.getTime()) ? t.getUTCHours() : 0;
+      matrix[l.action][h] += 1;
+    }
+
+    const max = Math.max(
+      1,
+      ...Object.values(matrix).flatMap((arr) => arr),
+    );
+    return { topActions, matrix, max };
+  }, [logs]);
 
   const parseLinksField = (value: unknown): string[] | undefined => {
     if (value === null || value === undefined) return undefined;
@@ -750,12 +986,20 @@ export default function Home() {
               <TabButton tab="data" label="Data" />
               <TabButton tab="generator" label="Generator" />
               <TabButton tab="analysis" label="Analysis" />
+              <TabButton tab="assistant" label="Assistant" />
               <TabButton tab="graph" label="Graph" />
               <TabButton tab="results" label="Results" />
               <TabButton tab="review" label="Review" />
               <TabButton tab="evidence" label="Evidence" />
             </div>
             <div className="flex items-center gap-2">
+              <button
+                onClick={() => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))}
+                className="px-3 py-2 rounded-md border border-slate-800 bg-black/40 text-sm text-slate-200 hover:bg-slate-900/40"
+                title="Toggle theme"
+              >
+                {theme === 'dark' ? 'Black' : 'Dim'}
+              </button>
               <button
                 onClick={() => {
                   setLogs([]);
@@ -967,6 +1211,42 @@ export default function Home() {
                 </ul>
               </Card>
             </div>
+
+            <Card title="Temporal Heatmap" subtitle="Event intensity by UTC hour (top actions)">
+              <div className="overflow-auto">
+                <div className="min-w-[760px]">
+                  <div className="grid grid-cols-[140px_repeat(24,minmax(18px,1fr))] gap-1 text-xs text-slate-400">
+                    <div />
+                    {Array.from({ length: 24 }, (_, h) => (
+                      <div key={h} className="text-center">
+                        {h}
+                      </div>
+                    ))}
+                  </div>
+                  <div className="mt-2 space-y-1">
+                    {temporalHeatmap.topActions.length === 0 && <div className="text-sm text-slate-500">No events loaded.</div>}
+                    {temporalHeatmap.topActions.map((action) => (
+                      <div key={action} className="grid grid-cols-[140px_repeat(24,minmax(18px,1fr))] gap-1 items-center">
+                        <div className="truncate text-xs text-slate-200 pr-2">{action}</div>
+                        {temporalHeatmap.matrix[action].map((count, h) => {
+                          const intensity = count / temporalHeatmap.max;
+                          const bg = `rgba(34, 211, 238, ${Math.max(0.05, intensity * 0.9)})`;
+                          return (
+                            <div
+                              key={`${action}-${h}`}
+                              title={`${action} @ ${h}:00 UTC — ${count}`}
+                              className="h-5 rounded border border-slate-800"
+                              style={{ background: count === 0 ? 'rgba(0,0,0,0.25)' : bg }}
+                            />
+                          );
+                        })}
+                      </div>
+                    ))}
+                  </div>
+                  <div className="mt-3 text-xs text-slate-500">Tip: spikes often reveal scheduled farms or coordinated campaigns.</div>
+                </div>
+              </div>
+            </Card>
           </>
         )}
 
@@ -1494,6 +1774,80 @@ export default function Home() {
           </div>
         )}
 
+        {activeTab === 'assistant' && (
+          <Card title="Local Assistant" subtitle="Local-first help and recommendations (no external APIs)">
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={() => {
+                  const now = new Date().toISOString();
+                  setAssistantMessages((prev) => [...prev, { role: 'assistant', text: assistantExplainCurrent(), at: now }]);
+                }}
+                className="px-3 py-2 rounded-md bg-slate-100 text-slate-950 text-sm font-semibold"
+              >
+                Explain current results
+              </button>
+              <button
+                onClick={() => setAssistantMessages([])}
+                className="px-3 py-2 rounded-md border border-slate-800 bg-black/40 text-sm text-slate-200"
+              >
+                Clear
+              </button>
+            </div>
+
+            <div className="mt-4 border border-slate-800 bg-black/40 rounded-lg p-3 max-h-[520px] overflow-y-auto">
+              {assistantMessages.length === 0 ? (
+                <div className="text-sm text-slate-400">
+                  Ask questions like:
+                  <ul className="mt-2 list-disc pl-4">
+                    <li>Why was an actor flagged?</li>
+                    <li>How should I set thresholds?</li>
+                    <li>What does a wave mean?</li>
+                    <li>How do link signals catch scammers?</li>
+                  </ul>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {assistantMessages.map((m, idx) => (
+                    <div key={`${m.at}-${idx}`} className={m.role === 'assistant' ? 'text-slate-100' : 'text-slate-200'}>
+                      <div className="text-xs text-slate-500">{m.role} · {m.at}</div>
+                      <pre className="whitespace-pre-wrap text-sm leading-5 mt-1">{m.text}</pre>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            <div className="mt-3 flex gap-2">
+              <input
+                value={assistantInput}
+                onChange={(e) => setAssistantInput(e.target.value)}
+                placeholder="Ask a question…"
+                className="flex-1 border border-slate-800 bg-slate-950/60 rounded px-2 py-2 text-sm text-slate-100 placeholder:text-slate-500"
+                onKeyDown={(e) => {
+                  if (e.key !== 'Enter') return;
+                  const q = assistantInput.trim();
+                  if (!q) return;
+                  const now = new Date().toISOString();
+                  setAssistantMessages((prev) => [...prev, { role: 'user', text: q, at: now }, { role: 'assistant', text: assistantAnswer(q), at: new Date().toISOString() }]);
+                  setAssistantInput('');
+                }}
+              />
+              <button
+                onClick={() => {
+                  const q = assistantInput.trim();
+                  if (!q) return;
+                  const now = new Date().toISOString();
+                  setAssistantMessages((prev) => [...prev, { role: 'user', text: q, at: now }, { role: 'assistant', text: assistantAnswer(q), at: new Date().toISOString() }]);
+                  setAssistantInput('');
+                }}
+                className="px-4 py-2 rounded-md bg-gradient-to-r from-cyan-500 via-violet-500 to-emerald-500 text-slate-950 text-sm font-semibold"
+              >
+                Ask
+              </button>
+            </div>
+          </Card>
+        )}
+
         {activeTab === 'graph' && (
           <Card title="Graph" subtitle="Red nodes are above your threshold">
             <div style={{ width: '100%', height: '640px' }}>
@@ -1662,10 +2016,21 @@ export default function Home() {
               >
                 Copy JSON
               </button>
+              <button
+                onClick={async () => {
+                  await navigator.clipboard.writeText(evidenceSummary);
+                  setSourceStatus('Copied summary to clipboard');
+                }}
+                disabled={logs.length === 0}
+                className="px-3 py-2 rounded-md border border-slate-800 bg-black/40 text-sm text-slate-200 disabled:opacity-50"
+              >
+                Copy summary
+              </button>
               <div className="text-sm text-slate-300">
                 Flagged: <span className="font-medium text-slate-100">{flaggedScorecards.length.toLocaleString()}</span>
               </div>
             </div>
+            <pre className="mt-4 bg-black/50 text-slate-100 border border-slate-800 rounded-lg p-3 overflow-auto text-sm max-h-[220px]">{evidenceSummary}</pre>
             <pre className="mt-4 bg-black/50 text-slate-100 border border-slate-800 rounded-lg p-3 overflow-auto text-xs max-h-[720px]">{evidenceJson}</pre>
           </Card>
         )}
