@@ -1,13 +1,15 @@
 'use client';
 
 import dynamic from 'next/dynamic';
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import Image from 'next/image';
 import type { EdgeDefinition, ElementDefinition, NodeDefinition, NodeSingular } from 'cytoscape';
 import { computeSharedLinksByActor, extractLinks, isSuspiciousDomain, linkDiversityScore, normalizeLinks, updateProfileAnomalyScore } from '../lib/profile';
 import { extractUrlsFromText } from '../lib/urlResolvers';
 import { computeHandlePatternScores, isLikelyPhishingUrl } from '../lib/scam';
+import type { ReviewDecision } from '../lib/reviewStore';
+import { deleteReview, getAllReviews, upsertReview } from '../lib/reviewStore';
 import Papa from 'papaparse';
 
 // Dynamically import CytoscapeComponent to avoid SSR issues
@@ -98,7 +100,7 @@ interface AnalysisSettings {
   churnActions: string[];
 }
 
-type TabKey = 'dashboard' | 'data' | 'analysis' | 'graph' | 'results' | 'evidence';
+type TabKey = 'dashboard' | 'data' | 'generator' | 'analysis' | 'graph' | 'results' | 'review' | 'evidence';
 
 export default function Home() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -150,6 +152,24 @@ export default function Home() {
       reasons?: string[];
     }>
   >([]);
+  const [autoAddProfilesToDataset, setAutoAddProfilesToDataset] = useState(true);
+  const [autoImportFromProfileLinks, setAutoImportFromProfileLinks] = useState(true);
+
+  const [syntheticSeed, setSyntheticSeed] = useState<number>(() => Math.floor(Date.now() % 1_000_000));
+  const [syntheticOrganicUsers, setSyntheticOrganicUsers] = useState(80);
+  const [syntheticOrganicActions, setSyntheticOrganicActions] = useState(800);
+  const [syntheticTargets, setSyntheticTargets] = useState(8);
+  const [syntheticSybilClusters, setSyntheticSybilClusters] = useState(2);
+  const [syntheticSybilClusterSize, setSyntheticSybilClusterSize] = useState(12);
+  const [syntheticBurstTargetIndex, setSyntheticBurstTargetIndex] = useState(0);
+  const [syntheticBurstActors, setSyntheticBurstActors] = useState(10);
+  const [syntheticBurstActions, setSyntheticBurstActions] = useState(3);
+  const [syntheticMinutes, setSyntheticMinutes] = useState(120);
+  const [syntheticIncludeProfiles, setSyntheticIncludeProfiles] = useState(true);
+  const [syntheticGroundTruth, setSyntheticGroundTruth] = useState<{ sybilActors: string[]; burstTarget: string } | null>(null);
+  const [syntheticLastLogs, setSyntheticLastLogs] = useState<LogEntry[] | null>(null);
+
+  const [reviews, setReviews] = useState<Record<string, { decision: ReviewDecision | ''; note?: string; updatedAt: string }>>({});
 
   const TabButton = ({ tab, label }: { tab: TabKey; label: string }) => (
     <button
@@ -266,6 +286,25 @@ export default function Home() {
     };
   }, [clusters.length, flaggedScorecards.length, logSummary.uniqueActors, logSummary.uniqueTargets, logs, scorecards, settings.churnActions, waves]);
 
+  useEffect(() => {
+    let cancelled = false;
+    getAllReviews()
+      .then((all) => {
+        if (cancelled) return;
+        const map: Record<string, { decision: ReviewDecision | ''; note?: string; updatedAt: string }> = {};
+        all.forEach((r) => {
+          map[r.actor] = { decision: r.decision, note: r.note, updatedAt: r.updatedAt };
+        });
+        setReviews(map);
+      })
+      .catch(() => {
+        // ignore
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const evidenceObject = useMemo(() => {
     const profileLinks = Object.fromEntries(
       scorecards.map((s) => [
@@ -283,12 +322,14 @@ export default function Home() {
       exportedAt: new Date().toISOString(),
       settings,
       insights,
+      reviews,
       clusters,
       waves,
       scorecards: flaggedScorecards,
       profileLinks,
+      syntheticGroundTruth: syntheticGroundTruth ?? undefined,
     };
-  }, [clusters, insights, scorecards, flaggedScorecards, settings, waves]);
+  }, [clusters, insights, reviews, scorecards, flaggedScorecards, settings, syntheticGroundTruth, waves]);
 
   const evidenceJson = useMemo(() => JSON.stringify(evidenceObject, null, 2), [evidenceObject]);
 
@@ -428,7 +469,17 @@ export default function Home() {
       setSourceStatus(`${label}: no events returned`);
       return;
     }
-    setLogs((prev) => [...prev, ...newLogs]);
+    setLogs((prev) => {
+      const seen = new Set(prev.map((l) => `${l.timestamp}|${l.platform}|${l.action}|${l.actor}|${l.target}`));
+      const merged = prev.slice();
+      for (const l of newLogs) {
+        const key = `${l.timestamp}|${l.platform}|${l.action}|${l.actor}|${l.target}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push(l);
+      }
+      return merged;
+    });
     setFileUploaded(true);
     setSourceStatus(`${label}: added ${newLogs.length.toLocaleString()} events`);
   };
@@ -555,11 +606,118 @@ export default function Home() {
       const json = (await res.json()) as { error?: string; profiles?: typeof profileScanResults };
       if (!res.ok) throw new Error(json.error || `Request failed (${res.status})`);
       setProfileScanResults(json.profiles || []);
-      setSourceStatus(`Profile scan complete: ${(json.profiles || []).length} scanned`);
+      const profiles = json.profiles || [];
+
+      if (autoAddProfilesToDataset) {
+        const now = new Date().toISOString();
+        const profileLogs: LogEntry[] = profiles.flatMap((p) => {
+          if (!p.ok || !p.actorId || !p.url) return [];
+          const platform = p.actorId.includes(':') ? p.actorId.split(':')[0] : 'profile';
+          return [
+            {
+              timestamp: now,
+              platform,
+              action: 'profile',
+              actor: p.actorId,
+              target: p.url,
+              targetType: 'profile',
+              bio: p.bio,
+              links: p.links,
+              meta: JSON.stringify({
+                source: 'profile-scan',
+                title: p.title,
+                riskScore: p.riskScore,
+                reasons: p.reasons,
+                linkDiversity: p.linkDiversity,
+              }),
+            },
+          ];
+        });
+        if (profileLogs.length > 0) appendLogs(profileLogs, 'Profile scan');
+      }
+
+      if (autoImportFromProfileLinks) {
+        const candidateLinks = profiles
+          .flatMap((p) => (p.ok ? p.links || [] : []))
+          .slice(0, 50);
+        if (candidateLinks.length > 0) {
+          // Import API resolves share links to raw CSV/JSON when possible.
+          await importFromUrls(candidateLinks);
+        }
+      }
+
+      setSourceStatus(`Profile scan complete: ${profiles.length} scanned`);
     } catch (e) {
       setSourceStatus(null);
       setSourceError(e instanceof Error ? e.message : 'Failed to scan profiles');
     }
+  };
+
+  const generateSynthetic = async () => {
+    try {
+      setSourceError(null);
+      setSourceStatus('Generating synthetic dataset...');
+      const res = await fetch('/api/generate/synthetic', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          seed: syntheticSeed,
+          minutes: syntheticMinutes,
+          organicUsers: syntheticOrganicUsers,
+          organicActions: syntheticOrganicActions,
+          targets: syntheticTargets,
+          sybilClusters: syntheticSybilClusters,
+          sybilClusterSize: syntheticSybilClusterSize,
+          burstTargetIndex: syntheticBurstTargetIndex,
+          burstActorsPerCluster: syntheticBurstActors,
+          burstActionsPerActor: syntheticBurstActions,
+          includeProfiles: syntheticIncludeProfiles,
+        }),
+      });
+      const json = (await res.json()) as {
+        error?: string;
+        logs?: LogEntry[];
+        groundTruth?: { sybilActors: string[]; burstTarget: string };
+        config?: unknown;
+      };
+      if (!res.ok) throw new Error(json.error || `Request failed (${res.status})`);
+      setSyntheticLastLogs(json.logs || []);
+      setSyntheticGroundTruth(json.groundTruth || null);
+      setSourceStatus(`Generated ${(json.logs || []).length.toLocaleString()} events`);
+      setActiveTab('generator');
+    } catch (e) {
+      setSourceStatus(null);
+      setSourceError(e instanceof Error ? e.message : 'Failed to generate synthetic dataset');
+    }
+  };
+
+  const loadSyntheticIntoApp = () => {
+    if (!syntheticLastLogs) return;
+    setLogs(syntheticLastLogs);
+    setFileUploaded(true);
+    setSourceStatus(`Loaded synthetic dataset (${syntheticLastLogs.length.toLocaleString()} events)`);
+    setActiveTab('analysis');
+  };
+
+  const downloadSyntheticCsv = () => {
+    if (!syntheticLastLogs || syntheticLastLogs.length === 0) return;
+    const csv = Papa.unparse(syntheticLastLogs as unknown as Record<string, unknown>[]);
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `synthetic-${syntheticSeed}.csv`;
+    a.click();
+  };
+
+  const downloadSyntheticJson = () => {
+    if (!syntheticLastLogs) return;
+    const blob = new Blob([JSON.stringify({ logs: syntheticLastLogs, groundTruth: syntheticGroundTruth }, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `synthetic-${syntheticSeed}.json`;
+    a.click();
   };
 
   const processData = (data: LogEntry[]) => {
@@ -881,9 +1039,11 @@ export default function Home() {
             <div className="flex flex-wrap items-center gap-2">
               <TabButton tab="dashboard" label="Dashboard" />
               <TabButton tab="data" label="Data" />
+              <TabButton tab="generator" label="Generator" />
               <TabButton tab="analysis" label="Analysis" />
               <TabButton tab="graph" label="Graph" />
               <TabButton tab="results" label="Results" />
+              <TabButton tab="review" label="Review" />
               <TabButton tab="evidence" label="Evidence" />
             </div>
             <div className="flex items-center gap-2">
@@ -1266,6 +1426,14 @@ export default function Home() {
                   <button onClick={scanProfilesForAnomalies} className="px-3 py-1.5 rounded bg-cyan-500 text-slate-950 text-sm font-semibold hover:bg-cyan-400">
                     Scan profiles
                   </button>
+                  <label className="text-xs text-slate-300 flex items-center gap-2">
+                    <input type="checkbox" checked={autoAddProfilesToDataset} onChange={(e) => setAutoAddProfilesToDataset(e.target.checked)} />
+                    Auto-add profiles to dataset
+                  </label>
+                  <label className="text-xs text-slate-300 flex items-center gap-2">
+                    <input type="checkbox" checked={autoImportFromProfileLinks} onChange={(e) => setAutoImportFromProfileLinks(e.target.checked)} />
+                    Auto-import datasets from profile links
+                  </label>
                   <div className="text-xs text-slate-400">Scanned: {profileScanResults.length}</div>
                 </div>
                 {profileScanResults.length > 0 && (
@@ -1321,6 +1489,165 @@ export default function Home() {
               </button>
               <div className="text-sm text-slate-300">
                 Loaded events: <span className="font-medium text-slate-100">{logs.length.toLocaleString()}</span>
+              </div>
+            </div>
+          </Card>
+        )}
+
+        {activeTab === 'generator' && (
+          <Card title="Synthetic Attack Generator" subtitle="Create safe, labeled Sybil scenarios for testing (no real data required)">
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+              <div className="space-y-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <label className="text-sm text-slate-200 block">
+                    Seed
+                    <input
+                      type="number"
+                      value={syntheticSeed}
+                      onChange={(e) => setSyntheticSeed(Number.parseInt(e.target.value || '0', 10) || 0)}
+                      className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                    />
+                  </label>
+                  <label className="text-sm text-slate-200 block">
+                    Minutes
+                    <input
+                      type="number"
+                      min={5}
+                      max={1440}
+                      value={syntheticMinutes}
+                      onChange={(e) => setSyntheticMinutes(Math.max(5, Number.parseInt(e.target.value || '120', 10) || 120))}
+                      className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                    />
+                  </label>
+                  <label className="text-sm text-slate-200 block">
+                    Organic users
+                    <input
+                      type="number"
+                      min={5}
+                      value={syntheticOrganicUsers}
+                      onChange={(e) => setSyntheticOrganicUsers(Math.max(5, Number.parseInt(e.target.value || '80', 10) || 80))}
+                      className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                    />
+                  </label>
+                  <label className="text-sm text-slate-200 block">
+                    Organic actions
+                    <input
+                      type="number"
+                      min={10}
+                      value={syntheticOrganicActions}
+                      onChange={(e) => setSyntheticOrganicActions(Math.max(10, Number.parseInt(e.target.value || '800', 10) || 800))}
+                      className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                    />
+                  </label>
+                  <label className="text-sm text-slate-200 block">
+                    Targets
+                    <input
+                      type="number"
+                      min={1}
+                      value={syntheticTargets}
+                      onChange={(e) => setSyntheticTargets(Math.max(1, Number.parseInt(e.target.value || '8', 10) || 8))}
+                      className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                    />
+                  </label>
+                  <label className="text-sm text-slate-200 block">
+                    Sybil clusters
+                    <input
+                      type="number"
+                      min={0}
+                      value={syntheticSybilClusters}
+                      onChange={(e) => setSyntheticSybilClusters(Math.max(0, Number.parseInt(e.target.value || '2', 10) || 2))}
+                      className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                    />
+                  </label>
+                  <label className="text-sm text-slate-200 block">
+                    Cluster size
+                    <input
+                      type="number"
+                      min={3}
+                      value={syntheticSybilClusterSize}
+                      onChange={(e) => setSyntheticSybilClusterSize(Math.max(3, Number.parseInt(e.target.value || '12', 10) || 12))}
+                      className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                    />
+                  </label>
+                  <label className="text-sm text-slate-200 block">
+                    Burst target index
+                    <input
+                      type="number"
+                      min={0}
+                      value={syntheticBurstTargetIndex}
+                      onChange={(e) => setSyntheticBurstTargetIndex(Math.max(0, Number.parseInt(e.target.value || '0', 10) || 0))}
+                      className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                    />
+                  </label>
+                  <label className="text-sm text-slate-200 block">
+                    Burst actors/cluster
+                    <input
+                      type="number"
+                      min={1}
+                      value={syntheticBurstActors}
+                      onChange={(e) => setSyntheticBurstActors(Math.max(1, Number.parseInt(e.target.value || '10', 10) || 10))}
+                      className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                    />
+                  </label>
+                  <label className="text-sm text-slate-200 block">
+                    Burst actions/actor
+                    <input
+                      type="number"
+                      min={1}
+                      value={syntheticBurstActions}
+                      onChange={(e) => setSyntheticBurstActions(Math.max(1, Number.parseInt(e.target.value || '3', 10) || 3))}
+                      className="mt-1 block border border-slate-800 bg-slate-950/60 rounded px-2 py-1 w-full text-sm text-slate-100"
+                    />
+                  </label>
+                </div>
+
+                <label className="text-sm text-slate-200 flex items-center gap-2">
+                  <input type="checkbox" checked={syntheticIncludeProfiles} onChange={(e) => setSyntheticIncludeProfiles(e.target.checked)} />
+                  Include profile fields (bio/links/createdAt)
+                </label>
+
+                <div className="flex flex-wrap gap-2">
+                  <button onClick={generateSynthetic} className="px-3 py-2 rounded-md bg-violet-500 text-slate-950 text-sm font-semibold hover:bg-violet-400">
+                    Generate
+                  </button>
+                  <button
+                    onClick={loadSyntheticIntoApp}
+                    disabled={!syntheticLastLogs || syntheticLastLogs.length === 0}
+                    className="px-3 py-2 rounded-md bg-emerald-500 text-slate-950 text-sm font-semibold disabled:opacity-50"
+                  >
+                    Load into app
+                  </button>
+                  <button
+                    onClick={downloadSyntheticCsv}
+                    disabled={!syntheticLastLogs || syntheticLastLogs.length === 0}
+                    className="px-3 py-2 rounded-md border border-slate-800 bg-black/50 text-sm text-slate-200 disabled:opacity-50"
+                  >
+                    Download CSV
+                  </button>
+                  <button
+                    onClick={downloadSyntheticJson}
+                    disabled={!syntheticLastLogs || syntheticLastLogs.length === 0}
+                    className="px-3 py-2 rounded-md border border-slate-800 bg-black/50 text-sm text-slate-200 disabled:opacity-50"
+                  >
+                    Download JSON
+                  </button>
+                </div>
+              </div>
+
+              <div className="border border-slate-800 bg-black/40 rounded-lg p-3">
+                <div className="text-sm font-medium">Last generation</div>
+                <div className="mt-2 text-sm text-slate-300">
+                  Events: <span className="text-slate-100 font-semibold">{(syntheticLastLogs?.length || 0).toLocaleString()}</span>
+                </div>
+                {syntheticGroundTruth && (
+                  <div className="mt-2 text-sm text-slate-300">
+                    Ground truth sybils: <span className="text-slate-100 font-semibold">{syntheticGroundTruth.sybilActors.length.toLocaleString()}</span>
+                    <div className="text-xs text-slate-400 mt-1">Burst target: {syntheticGroundTruth.burstTarget}</div>
+                  </div>
+                )}
+                <div className="mt-3 text-xs text-slate-400">
+                  Tip: after loading, go to Analysis tab, tune thresholds, run analysis, then compare flagged actors to ground truth.
+                </div>
               </div>
             </div>
           </Card>
@@ -1530,7 +1857,14 @@ export default function Home() {
                   .map((s) => (
                     <li key={s.actor} className="border border-slate-800 bg-slate-950/30 rounded-lg p-3">
                       <div className="flex items-start justify-between gap-3">
-                        <div className="font-medium">{s.actor}</div>
+                        <div className="font-medium flex items-center gap-2">
+                          <span>{s.actor}</span>
+                          {reviews[s.actor]?.decision && (
+                            <span className="text-[10px] px-2 py-0.5 rounded-full border border-slate-700 text-slate-300">
+                              {reviews[s.actor].decision}
+                            </span>
+                          )}
+                        </div>
                         <div className="text-sm">
                           Score <span className="font-semibold">{s.sybilScore.toFixed(2)}</span>
                         </div>
@@ -1594,6 +1928,101 @@ export default function Home() {
               </div>
             </div>
             <pre className="mt-4 bg-black/50 text-slate-100 border border-slate-800 rounded-lg p-3 overflow-auto text-xs max-h-[720px]">{evidenceJson}</pre>
+          </Card>
+        )}
+
+        {activeTab === 'review' && (
+          <Card title="Human Review" subtitle="Confirm / dismiss / escalate flagged actors with notes (stored locally in IndexedDB)">
+            <div className="text-sm text-slate-300">
+              Flagged actors: <span className="font-semibold text-slate-100">{flaggedScorecards.length.toLocaleString()}</span>
+            </div>
+            <div className="mt-3 space-y-3">
+              {flaggedScorecards.length === 0 && <div className="text-slate-500">Run analysis to populate flagged actors.</div>}
+              {flaggedScorecards.slice(0, 100).map((s) => (
+                <div key={s.actor} className="border border-slate-800 bg-black/40 rounded-lg p-3">
+                  <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-2">
+                    <div className="font-medium">{s.actor}</div>
+                    <div className="text-sm text-slate-300">
+                      Score <span className="font-semibold text-slate-100">{s.sybilScore.toFixed(2)}</span>
+                    </div>
+                  </div>
+                  {s.reasons.length > 0 && (
+                    <div className="mt-2 text-xs text-slate-300">
+                      <div className="text-slate-400">Signals</div>
+                      <ul className="mt-1 list-disc pl-4">
+                        {s.reasons.slice(0, 5).map((r) => (
+                          <li key={r}>{r}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    {(['confirm_sybil', 'dismiss', 'escalate'] as const).map((decision) => (
+                      <button
+                        key={decision}
+                        onClick={async () => {
+                          const note = reviews[s.actor]?.note || '';
+                          const updatedAt = new Date().toISOString();
+                          await upsertReview({ actor: s.actor, decision, note, updatedAt });
+                          setReviews((prev) => ({ ...prev, [s.actor]: { decision, note, updatedAt } }));
+                          setSourceStatus(`Saved review for ${s.actor}`);
+                        }}
+                        className={
+                          reviews[s.actor]?.decision === decision
+                            ? 'px-3 py-1.5 rounded-md bg-slate-100 text-slate-950 text-xs font-semibold'
+                            : 'px-3 py-1.5 rounded-md border border-slate-800 bg-black/40 text-xs text-slate-200 hover:bg-slate-900/40'
+                        }
+                      >
+                        {decision}
+                      </button>
+                    ))}
+                    <button
+                      onClick={async () => {
+                        await deleteReview(s.actor);
+                        setReviews((prev) => {
+                          const next = { ...prev };
+                          delete next[s.actor];
+                          return next;
+                        });
+                        setSourceStatus(`Cleared review for ${s.actor}`);
+                      }}
+                      className="px-3 py-1.5 rounded-md border border-slate-800 bg-black/40 text-xs text-slate-200 hover:bg-slate-900/40"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                  <div className="mt-2">
+                    <textarea
+                      value={reviews[s.actor]?.note || ''}
+                      onChange={(e) => setReviews((prev) => ({ ...prev, [s.actor]: { decision: prev[s.actor]?.decision || '', note: e.target.value, updatedAt: prev[s.actor]?.updatedAt || new Date().toISOString() } }))}
+                      placeholder="Add review notes..."
+                      className="w-full border border-slate-800 bg-slate-950/60 rounded px-2 py-1 text-sm text-slate-100 placeholder:text-slate-500 h-16"
+                    />
+                    <div className="mt-1 flex items-center gap-2">
+                      <button
+                        onClick={async () => {
+                          const decision = reviews[s.actor]?.decision;
+                          if (!decision) {
+                            setSourceError('Select a decision before saving notes.');
+                            return;
+                          }
+                          const note = reviews[s.actor]?.note || '';
+                          const updatedAt = new Date().toISOString();
+                          await upsertReview({ actor: s.actor, decision, note, updatedAt });
+                          setReviews((prev) => ({ ...prev, [s.actor]: { decision, note, updatedAt } }));
+                          setSourceStatus(`Saved notes for ${s.actor}`);
+                        }}
+                        className="px-3 py-1.5 rounded-md bg-emerald-500 text-slate-950 text-xs font-semibold"
+                      >
+                        Save notes
+                      </button>
+                      {reviews[s.actor]?.updatedAt && <span className="text-xs text-slate-500">Updated {reviews[s.actor].updatedAt}</span>}
+                    </div>
+                  </div>
+                </div>
+              ))}
+              {flaggedScorecards.length > 100 && <div className="text-xs text-slate-500">Showing first 100 flagged actors.</div>}
+            </div>
           </Card>
         )}
       </main>
