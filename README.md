@@ -7,10 +7,9 @@
 
 ## Demo Video
 
-<video width="100%" controls>
-  <source src="promo.mp4" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
+<img src="promo.gif" width="100%" alt="Sybil Shield Demo">
+
+Full video available for download: [promo.mp4](promo.mp4)
 
 Sybil Shield is a powerful, local-first Next.js application designed for detecting coordinated Sybil attacks, scammer patterns, and mini-app exploits across social, onchain, and mini-app ecosystems. Built for human review, it provides explainable evidence packs with "why flagged" reasons, empowering analysts to make informed decisions without automatic bans.
 
